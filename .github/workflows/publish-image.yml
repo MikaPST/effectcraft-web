@@ -1,0 +1,211 @@
+name: Build and publish EffectCraft Web
+
+on:
+  schedule:
+    # Weekly rebuild from upstream EffectCraft main (UTC).
+    - cron: "57 4 * * 1"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "docker-compose.yml"
+      - "README.md"
+      - ".github/workflows/publish-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: effectcraft-web-publish
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out packaging repository
+        uses: actions/checkout@v4
+
+      - name: Check out EffectCraft source
+        uses: actions/checkout@v4
+        with:
+          repository: storytold/effectcraft
+          ref: main
+          path: upstream
+          fetch-depth: 1
+
+      - name: Record upstream revision
+        id: source
+        shell: bash
+        run: |
+          echo "effectcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "effectcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "upstream -> upstream/target"
+
+      - name: Install matching wasm-bindgen CLI
+        shell: bash
+        run: |
+          WASM_BINDGEN_VERSION="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          lock = tomllib.loads(Path("upstream/Cargo.lock").read_text())
+          versions = {
+              pkg["version"]
+              for pkg in lock["package"]
+              if pkg["name"] == "wasm-bindgen"
+          }
+          if not versions:
+              raise SystemExit("No wasm-bindgen package found in upstream/Cargo.lock")
+
+          def version_key(version):
+              return tuple(int(part) for part in version.split("-")[0].split("."))
+
+          print(max(versions, key=version_key))
+          PY
+          )"
+          echo "Installing wasm-bindgen-cli ${WASM_BINDGEN_VERSION}"
+          cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
+
+      - name: Build EffectCraft WebAssembly app
+        shell: bash
+        env:
+          CARGO_BUILD_JOBS: "2"
+        run: |
+          cd upstream
+          cargo xtask web
+
+      - name: Prepare Docker build context and NGINX configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WEB_DIST="upstream/target/web/dist"
+          test -f "${WEB_DIST}/index.html"
+          test -f "${WEB_DIST}/effectcraft_web.js"
+          test -f "${WEB_DIST}/worker.js"
+          test -f "${WEB_DIST}/audio-worklet.js"
+          test -f "${WEB_DIST}/sw.js"
+          test -f "${WEB_DIST}/manifest.webmanifest"
+          test -f "${WEB_DIST}/effectcraft_web_bg.wasm"
+
+          mkdir -p docker-build/dist
+          cp -a "${WEB_DIST}/." docker-build/dist/
+
+          # Upstream assets use stable names; clients must revalidate on updates.
+          cat > docker-build/nginx.conf <<'NGINX'
+          server {
+              listen 8080;
+              listen [::]:8080;
+              server_name _;
+
+              root /usr/share/nginx/html;
+              index index.html;
+
+              types {
+                  application/wasm wasm;
+                  text/javascript js;
+                  text/html html;
+                  application/manifest+json webmanifest;
+              }
+
+              gzip on;
+              gzip_vary on;
+              gzip_min_length 1024;
+              gzip_types
+                  application/wasm
+                  application/javascript
+                  text/javascript
+                  application/manifest+json
+                  text/css
+                  text/html
+                  application/json;
+
+              location / {
+                  try_files $uri $uri/ =404;
+              }
+
+              location = /index.html {
+                  add_header Cache-Control "no-cache";
+              }
+
+              location = /sw.js {
+                  add_header Cache-Control "no-cache";
+              }
+
+              location ~* \.(wasm|js)$ {
+                  add_header Cache-Control "no-cache";
+              }
+
+              location = /manifest.webmanifest {
+                  add_header Cache-Control "no-cache";
+              }
+          }
+          NGINX
+
+          cat > docker-build/Dockerfile <<'DOCKERFILE'
+          FROM nginx:alpine
+
+          ARG EFFECTCRAFT_COMMIT
+
+          LABEL org.opencontainers.image.title="EffectCraft Web"
+          LABEL org.opencontainers.image.description="Self-hosted browser build of EffectCraft"
+          LABEL org.opencontainers.image.source="https://github.com/storytold/effectcraft"
+          LABEL org.opencontainers.image.revision="${EFFECTCRAFT_COMMIT}"
+
+          RUN rm -f /etc/nginx/conf.d/default.conf
+
+          COPY nginx.conf /etc/nginx/conf.d/default.conf
+          COPY dist/ /usr/share/nginx/html/
+
+          EXPOSE 8080
+          DOCKERFILE
+
+          echo "WebAssembly size:"
+          du -h docker-build/dist/effectcraft_web_bg.wasm
+          echo "Generated Docker build context:"
+          find docker-build -maxdepth 2 -type f | sort | head -80
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/mikapst/effectcraft-web
+          tags: |
+            type=raw,value=latest
+            type=raw,value=upstream-${{ steps.source.outputs.effectcraft_short }}
+
+      - name: Build and publish multi-platform image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ github.workspace }}/docker-build
+          file: ${{ github.workspace }}/docker-build/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            EFFECTCRAFT_COMMIT=${{ steps.source.outputs.effectcraft_sha }}

@@ -1,0 +1,7 @@
+services:
+  effectcraft-web:
+    image: ghcr.io/mikapst/effectcraft-web:latest
+    container_name: effectcraft-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"

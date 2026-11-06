@@ -5,6 +5,16 @@ on:
     # Weekly rebuild from upstream EffectCraft main (UTC).
     - cron: "57 4 * * 1"
   workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: "Official upstream release tag (empty = latest)"
+        required: false
+        type: string
+      force_rebuild:
+        description: "Rebuild an already published release"
+        required: false
+        default: false
+        type: boolean
   push:
     branches:
       - main
@@ -14,7 +24,7 @@ on:
       - ".github/workflows/publish-image.yml"
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 concurrency:
@@ -30,32 +40,83 @@ jobs:
       - name: Check out packaging repository
         uses: actions/checkout@v4
 
+      - name: Resolve official upstream release
+        id: upstream-release
+        uses: actions/github-script@v7
+        env:
+          REQUESTED_TAG: ${{ inputs.upstream_tag }}
+        with:
+          script: |
+            const requested = (process.env.REQUESTED_TAG || '').trim();
+            const args = { owner: 'storytold', repo: 'effectcraft' };
+            const result = requested
+              ? await github.rest.repos.getReleaseByTag({ ...args, tag: requested })
+              : await github.rest.repos.getLatestRelease(args);
+            const release = result.data;
+            if (!release.tag_name) throw new Error('No upstream release tag found');
+            core.setOutput('tag', release.tag_name);
+            core.setOutput('url', release.html_url);
+            core.setOutput('body', release.body || '');
+            core.setOutput('prerelease', String(release.prerelease));
+            core.setOutput('published_at', release.published_at || '');
+            core.setOutput('name', release.name || `effectcraft ${release.tag_name}`);
+
+      - name: Check local release
+        id: release-check
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.upstream-release.outputs.tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+        with:
+          script: |
+            let exists = false;
+            try {
+              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: process.env.TAG });
+              exists = true;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            const forced = process.env.FORCE_REBUILD === 'true' || context.eventName === 'push';
+            core.setOutput('skip', String(exists && !forced));
+
       - name: Check out EffectCraft source
+        if: steps.release-check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: storytold/effectcraft
-          ref: main
+          ref: ${{ steps.upstream-release.outputs.tag }}
           path: upstream
           fetch-depth: 1
 
       - name: Record upstream revision
+        if: steps.release-check.outputs.skip != 'true'
         id: source
         shell: bash
         run: |
           echo "effectcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "effectcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Record upstream release commit for image tags
+        if: steps.release-check.outputs.skip != 'true'
+        id: release-source
+        shell: bash
+        run: |
+          echo "short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust and WebAssembly target
+        if: steps.release-check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache Rust build artifacts
+        if: steps.release-check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
 
       - name: Install matching wasm-bindgen CLI
+        if: steps.release-check.outputs.skip != 'true'
         shell: bash
         run: |
           WASM_BINDGEN_VERSION="$(python3 - <<'PY'
@@ -81,6 +142,7 @@ jobs:
           cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
 
       - name: Build EffectCraft WebAssembly app
+        if: steps.release-check.outputs.skip != 'true'
         shell: bash
         env:
           CARGO_BUILD_JOBS: "2"
@@ -89,6 +151,7 @@ jobs:
           cargo xtask web
 
       - name: Prepare Docker build context and NGINX configuration
+        if: steps.release-check.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -180,9 +243,11 @@ jobs:
           find docker-build -maxdepth 2 -type f | sort | head -80
 
       - name: Set up Docker Buildx
+        if: steps.release-check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
+        if: steps.release-check.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -190,15 +255,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate image metadata
+        if: steps.release-check.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/mikapst/effectcraft-web
           tags: |
             type=raw,value=latest
+            type=raw,value=${{ steps.upstream-release.outputs.tag }}
             type=raw,value=upstream-${{ steps.source.outputs.effectcraft_short }}
 
       - name: Build and publish multi-platform image
+        if: steps.release-check.outputs.skip != 'true'
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ github.workspace }}/docker-build
@@ -209,3 +278,58 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             EFFECTCRAFT_COMMIT=${{ steps.source.outputs.effectcraft_sha }}
+
+      - name: Create or update versioned GitHub Release
+        if: steps.release-check.outputs.skip != 'true'
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.upstream-release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.upstream-release.outputs.name }}
+          RELEASE_URL: ${{ steps.upstream-release.outputs.url }}
+          RELEASE_NOTES: ${{ steps.upstream-release.outputs.body }}
+          RELEASE_PRERELEASE: ${{ steps.upstream-release.outputs.prerelease }}
+          RELEASE_PUBLISHED_AT: ${{ steps.upstream-release.outputs.published_at }}
+          RELEASE_SOURCE_SHA: ${{ steps.release-source.outputs.short }}
+          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const image = 'ghcr.io/mikapst/effectcraft-web';
+            const body = [
+              `Community-maintained Docker packaging for **${process.env.RELEASE_NAME}**.`,
+              '',
+              '## Docker image',
+              `- \`${image}:latest\``,
+              `- \`${image}:${tag}\``,
+              `- \`${image}:upstream-${process.env.RELEASE_SOURCE_SHA}\``,
+              '',
+              'Platforms: `linux/amd64`, `linux/arm64`.',
+              '',
+              `Official upstream release: ${process.env.RELEASE_URL}`,
+              `Published upstream: ${process.env.RELEASE_PUBLISHED_AT || 'not specified'}`,
+              '',
+              `Upstream source commit: \`${process.env.RELEASE_SOURCE_SHA}\``,
+              `Docker manifest digest: \`${process.env.RELEASE_DIGEST || 'not reported'}\``,
+              '',
+              '## Upstream release notes',
+              process.env.RELEASE_NOTES || 'No release notes provided upstream.',
+              '',
+              'This is an independent Docker packaging release, not an official upstream distribution.'
+            ].join('\n');
+            let existing;
+            try {
+              existing = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (existing) {
+              await github.rest.repos.updateRelease({
+                ...context.repo, release_id: existing.id, name: 'EffectCraft Web ' + tag,
+                body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
+              });
+            } else {
+              await github.rest.repos.createRelease({
+                ...context.repo, tag_name: tag, target_commitish: context.sha,
+                name: 'EffectCraft Web ' + tag, body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
+              });
+            }

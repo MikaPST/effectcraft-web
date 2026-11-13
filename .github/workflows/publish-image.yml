@@ -3,7 +3,7 @@ name: Build and publish EffectCraft Web
 on:
   schedule:
     # Weekly rebuild from upstream EffectCraft main (UTC).
-    - cron: "57 4 * * 1"
+    - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       upstream_tag:

@@ -1,335 +1,325 @@
 name: Build and publish EffectCraft Web
 
 on:
+  # Check the latest official upstream RELEASE every day, not the development branch.
   schedule:
-    # Weekly rebuild from upstream EffectCraft main (UTC).
     - cron: "17 3 * * *"
+
   workflow_dispatch:
     inputs:
       upstream_tag:
-        description: "Official upstream release tag (empty = latest)"
+        description: "Official EffectCraft release tag (empty = latest)"
         required: false
         type: string
       force_rebuild:
-        description: "Rebuild an already published release"
+        description: "Rebuild a release already published in this repository"
         required: false
         default: false
         type: boolean
+
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
+      - ".github/workflows/publish-image.yml"
+      - "Dockerfile"
+      - "nginx.conf"
+      - ".dockerignore"
       - "docker-compose.yml"
       - "README.md"
-      - ".github/workflows/publish-image.yml"
 
 permissions:
   contents: write
   packages: write
 
 concurrency:
-  group: effectcraft-web-publish
+  group: effectcraft-publish
   cancel-in-progress: false
 
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
-      - name: Check out packaging repository
+      # ---------------------------------------------------------------
+      # 01. Checkout and validate independent packaging configuration
+      # ---------------------------------------------------------------
+      - name: Checkout packaging repository
         uses: actions/checkout@v4
+        with:
+          path: packaging
 
-      - name: Resolve official upstream release
-        id: upstream-release
+      - name: Validate version-controlled packaging files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in Dockerfile nginx.conf .dockerignore docker-compose.yml README.md; do
+            test -s "packaging/$f" || { echo "::error::Missing packaging/$f"; exit 1; }
+          done
+
+      # ---------------------------------------------------------------
+      # 02. Resolve official release, and skip already-published tags
+      # ---------------------------------------------------------------
+      - name: Resolve official EffectCraft release
+        id: release
         uses: actions/github-script@v7
         env:
           REQUESTED_TAG: ${{ inputs.upstream_tag }}
         with:
           script: |
-            const requested = (process.env.REQUESTED_TAG || '').trim();
-            const args = { owner: 'storytold', repo: 'effectcraft' };
-            const result = requested
-              ? await github.rest.repos.getReleaseByTag({ ...args, tag: requested })
+            const tag = (process.env.REQUESTED_TAG || "").trim();
+            const args = {owner: "storytold", repo: "effectcraft"};
+            const {data: r} = tag
+              ? await github.rest.repos.getReleaseByTag({...args, tag})
               : await github.rest.repos.getLatestRelease(args);
-            const release = result.data;
-            if (!release.tag_name) throw new Error('No upstream release tag found');
-            core.setOutput('tag', release.tag_name);
-            core.setOutput('url', release.html_url);
-            core.setOutput('body', release.body || '');
-            core.setOutput('prerelease', String(release.prerelease));
-            core.setOutput('published_at', release.published_at || '');
-            core.setOutput('name', release.name || `effectcraft ${release.tag_name}`);
+            if (!r.tag_name) throw new Error("Official release tag missing");
+            core.setOutput("tag", r.tag_name);
+            core.setOutput("name", r.name || `EffectCraft ${r.tag_name}`);
+            core.setOutput("url", r.html_url);
+            core.setOutput("published_at", r.published_at || "");
+            core.setOutput("prerelease", String(r.prerelease));
 
-      - name: Check local release
-        id: release-check
+      - name: Check existing MikaPST GitHub Release
+        id: check
         uses: actions/github-script@v7
         env:
-          TAG: ${{ steps.upstream-release.outputs.tag }}
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          TAG: ${{ steps.release.outputs.tag }}
+          FORCE: ${{ inputs.force_rebuild }}
         with:
           script: |
             let exists = false;
             try {
-              await github.rest.repos.getReleaseByTag({ ...context.repo, tag: process.env.TAG });
+              await github.rest.repos.getReleaseByTag({...context.repo, tag: process.env.TAG});
               exists = true;
-            } catch (error) {
-              if (error.status !== 404) throw error;
+            } catch (e) {
+              if (e.status !== 404) throw e;
             }
-            const forced = process.env.FORCE_REBUILD === 'true' || context.eventName === 'push';
-            core.setOutput('skip', String(exists && !forced));
+            // Pushes to packaging files always rebuild. Scheduled/manual runs skip
+            // existing releases unless the user explicitly forces a rebuild.
+            const force = process.env.FORCE === "true" || context.eventName === "push";
+            core.setOutput("skip", String(exists && !force));
 
-      - name: Check out EffectCraft source
-        if: steps.release-check.outputs.skip != 'true'
+      # ---------------------------------------------------------------
+      # 03. Fetch official EffectCraft source at its selected release
+      # ---------------------------------------------------------------
+      - name: Checkout official EffectCraft source
+        if: steps.check.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           repository: storytold/effectcraft
-          ref: ${{ steps.upstream-release.outputs.tag }}
+          ref: ${{ steps.release.outputs.tag }}
           path: upstream
           fetch-depth: 1
 
-      - name: Record upstream revision
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Validate upstream build inputs and legal notices
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s upstream/Cargo.toml
+          test -s upstream/Cargo.lock
+          test -s upstream/xtask/src/main.rs
+          for f in LICENSE-MIT LICENSE-APACHE NOTICE ATTRIBUTION.md; do
+            test -s "upstream/$f" || { echo "::error::Missing upstream/$f"; exit 1; }
+          done
+
+      - name: Record the exact official source revision
+        if: steps.check.outputs.skip != 'true'
         id: source
         shell: bash
         run: |
-          echo "effectcraft_sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "effectcraft_short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Record upstream release commit for image tags
-        if: steps.release-check.outputs.skip != 'true'
-        id: release-source
-        shell: bash
-        run: |
+          set -euo pipefail
+          echo "sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "short=$(git -C upstream rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
+      # ---------------------------------------------------------------
+      # 04. Install Rust and matching upstream wasm-bindgen CLI
+      # ---------------------------------------------------------------
       - name: Install Rust and WebAssembly target
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Cache Rust build artifacts
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Cache Rust dependencies
+        if: steps.check.outputs.skip != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "upstream -> upstream/target"
 
-      - name: Install matching wasm-bindgen CLI
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Install wasm-bindgen CLI required by upstream xtask
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         run: |
-          WASM_BINDGEN_VERSION="$(python3 - <<'PY'
-          import tomllib
-          from pathlib import Path
+          set -euo pipefail
+          # The official `cargo xtask web` build checks this same constant.
+          version="$(sed -n 's/^const WASM_BINDGEN: &str = "\(.*\)";$/\1/p' upstream/xtask/src/main.rs)"
+          test -n "$version" || { echo "::error::Cannot resolve upstream wasm-bindgen CLI version"; exit 1; }
+          echo "Installing wasm-bindgen-cli $version"
+          cargo install wasm-bindgen-cli --version "$version" --locked
 
-          lock = tomllib.loads(Path("upstream/Cargo.lock").read_text())
-          versions = {
-              pkg["version"]
-              for pkg in lock["package"]
-              if pkg["name"] == "wasm-bindgen"
-          }
-          if not versions:
-              raise SystemExit("No wasm-bindgen package found in upstream/Cargo.lock")
-
-          def version_key(version):
-              return tuple(int(part) for part in version.split("-")[0].split("."))
-
-          print(max(versions, key=version_key))
-          PY
-          )"
-          echo "Installing wasm-bindgen-cli ${WASM_BINDGEN_VERSION}"
-          cargo install wasm-bindgen-cli --version "${WASM_BINDGEN_VERSION}" --locked
-
-      - name: Build EffectCraft WebAssembly app
-        if: steps.release-check.outputs.skip != 'true'
+      # ---------------------------------------------------------------
+      # 05. Compile once on the runner and validate the full PWA output
+      # ---------------------------------------------------------------
+      - name: Build official EffectCraft WebAssembly application
+        if: steps.check.outputs.skip != 'true'
+        working-directory: upstream
         shell: bash
         env:
           CARGO_BUILD_JOBS: "2"
         run: |
-          cd upstream
+          set -euo pipefail
           cargo xtask web
 
-      - name: Prepare Docker build context and NGINX configuration
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Validate WebAssembly, workers, PWA and relative URLs
+        if: steps.check.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
+          site=upstream/target/web/dist
+          for f in index.html effectcraft_web.js effectcraft_web_bg.wasm \
+                   worker.js audio-worklet.js sw.js manifest.webmanifest; do
+            test -s "$site/$f" || { echo "::error::Missing web artifact: $f"; exit 1; }
+          done
+          if grep -Eq '(src|href)="/[^/]' "$site/index.html"; then
+            echo "::error::Root-absolute URLs detected; upstream build expects relative URLs"
+            exit 1
+          fi
+          du -h "$site/effectcraft_web_bg.wasm"
 
-          WEB_DIST="upstream/target/web/dist"
-          test -f "${WEB_DIST}/index.html"
-          test -f "${WEB_DIST}/effectcraft_web.js"
-          test -f "${WEB_DIST}/worker.js"
-          test -f "${WEB_DIST}/audio-worklet.js"
-          test -f "${WEB_DIST}/sw.js"
-          test -f "${WEB_DIST}/manifest.webmanifest"
-          test -f "${WEB_DIST}/effectcraft_web_bg.wasm"
+      # ---------------------------------------------------------------
+      # 06. Assemble a disposable context from VERSIONED packaging files
+      # ---------------------------------------------------------------
+      - name: Prepare Docker context and preserve upstream licenses
+        if: steps.check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docker-context/site docker-context/legal
+          cp -a upstream/target/web/dist/. docker-context/site/
+          cp packaging/Dockerfile packaging/nginx.conf packaging/.dockerignore docker-context/
+          cp upstream/LICENSE-MIT upstream/LICENSE-APACHE \
+             upstream/NOTICE upstream/ATTRIBUTION.md docker-context/legal/
+          if test -d upstream/licenses; then
+            mkdir -p docker-context/legal/third-party
+            cp -a upstream/licenses/. docker-context/legal/third-party/
+          fi
+          if test -s upstream/docs/brand/LICENSE-brand.txt; then
+            cp upstream/docs/brand/LICENSE-brand.txt docker-context/legal/ARTCRAFT-BRAND-LICENSE.txt
+          fi
+          test -s docker-context/site/index.html
+          test -s docker-context/Dockerfile
+          test -s docker-context/nginx.conf
 
-          mkdir -p docker-build/dist
-          cp -a "${WEB_DIST}/." docker-build/dist/
-
-          # Upstream assets use stable names; clients must revalidate on updates.
-          cat > docker-build/nginx.conf <<'NGINX'
-          server {
-              listen 8080;
-              listen [::]:8080;
-              server_name _;
-
-              root /usr/share/nginx/html;
-              index index.html;
-
-              types {
-                  application/wasm wasm;
-                  text/javascript js;
-                  text/html html;
-                  application/manifest+json webmanifest;
-              }
-
-              gzip on;
-              gzip_vary on;
-              gzip_min_length 1024;
-              gzip_types
-                  application/wasm
-                  application/javascript
-                  text/javascript
-                  application/manifest+json
-                  text/css
-                  text/html
-                  application/json;
-
-              location / {
-                  try_files $uri $uri/ =404;
-              }
-
-              location = /index.html {
-                  add_header Cache-Control "no-cache";
-              }
-
-              location = /sw.js {
-                  add_header Cache-Control "no-cache";
-              }
-
-              location ~* \.(wasm|js)$ {
-                  add_header Cache-Control "no-cache";
-              }
-
-              location = /manifest.webmanifest {
-                  add_header Cache-Control "no-cache";
-              }
-          }
-          NGINX
-
-          cat > docker-build/Dockerfile <<'DOCKERFILE'
-          FROM nginx:alpine
-
-          ARG EFFECTCRAFT_COMMIT
-
-          LABEL org.opencontainers.image.title="EffectCraft Web"
-          LABEL org.opencontainers.image.description="Self-hosted browser build of EffectCraft"
-          LABEL org.opencontainers.image.source="https://github.com/storytold/effectcraft"
-          LABEL org.opencontainers.image.revision="${EFFECTCRAFT_COMMIT}"
-
-          RUN rm -f /etc/nginx/conf.d/default.conf
-
-          COPY nginx.conf /etc/nginx/conf.d/default.conf
-          COPY dist/ /usr/share/nginx/html/
-
-          EXPOSE 8080
-          DOCKERFILE
-
-          echo "WebAssembly size:"
-          du -h docker-build/dist/effectcraft_web_bg.wasm
-          echo "Generated Docker build context:"
-          find docker-build -maxdepth 2 -type f | sort | head -80
+      # ---------------------------------------------------------------
+      # 07. Build and push one manifest for both target architectures
+      # ---------------------------------------------------------------
+      - name: Set up QEMU
+        if: steps.check.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
-        if: steps.release-check.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Generate image metadata
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Prepare published image tags
+        if: steps.check.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/mikapst/effectcraft-web
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.upstream-release.outputs.tag }}
-            type=raw,value=upstream-${{ steps.source.outputs.effectcraft_short }}
+            type=raw,value=${{ steps.release.outputs.tag }}
+            type=raw,value=upstream-${{ steps.source.outputs.short }}
 
-      - name: Build and publish multi-platform image
-        if: steps.release-check.outputs.skip != 'true'
+      - name: Build and publish multi-platform Docker image
+        if: steps.check.outputs.skip != 'true'
         id: build
         uses: docker/build-push-action@v6
         with:
-          context: ${{ github.workspace }}/docker-build
-          file: ${{ github.workspace }}/docker-build/Dockerfile
+          context: ./docker-context
+          file: ./docker-context/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/MikaPST/effectcraft-web
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
           build-args: |
-            EFFECTCRAFT_COMMIT=${{ steps.source.outputs.effectcraft_sha }}
+            EFFECTCRAFT_COMMIT=${{ steps.source.outputs.sha }}
+            EFFECTCRAFT_VERSION=${{ steps.release.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      - name: Create or update versioned GitHub Release
-        if: steps.release-check.outputs.skip != 'true'
+      # ---------------------------------------------------------------
+      # 08. GitHub release only AFTER a successful GHCR image push
+      # ---------------------------------------------------------------
+      - name: Create or update matching MikaPST GitHub Release
+        if: steps.check.outputs.skip != 'true'
         uses: actions/github-script@v7
         env:
-          RELEASE_TAG: ${{ steps.upstream-release.outputs.tag }}
-          RELEASE_NAME: ${{ steps.upstream-release.outputs.name }}
-          RELEASE_URL: ${{ steps.upstream-release.outputs.url }}
-          RELEASE_NOTES: ${{ steps.upstream-release.outputs.body }}
-          RELEASE_PRERELEASE: ${{ steps.upstream-release.outputs.prerelease }}
-          RELEASE_PUBLISHED_AT: ${{ steps.upstream-release.outputs.published_at }}
-          RELEASE_SOURCE_SHA: ${{ steps.release-source.outputs.short }}
-          RELEASE_DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.release.outputs.name }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+          RELEASE_DATE: ${{ steps.release.outputs.published_at }}
+          RELEASE_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_SHORT: ${{ steps.source.outputs.short }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         with:
           script: |
             const tag = process.env.RELEASE_TAG;
-            const image = 'ghcr.io/mikapst/effectcraft-web';
+            const image = "ghcr.io/mikapst/effectcraft-web";
+            const {data: upstream} = await github.rest.repos.getReleaseByTag({
+              owner: "storytold", repo: "effectcraft", tag
+            });
             const body = [
-              `Community-maintained Docker packaging for **${process.env.RELEASE_NAME}**.`,
-              '',
-              '## Docker image',
+              `Community-maintained Docker packaging of **${process.env.RELEASE_NAME}**.`,
+              "",
+              "## Docker image",
               `- \`${image}:latest\``,
               `- \`${image}:${tag}\``,
-              `- \`${image}:upstream-${process.env.RELEASE_SOURCE_SHA}\``,
-              '',
-              'Platforms: `linux/amd64`, `linux/arm64`.',
-              '',
-              `Official upstream release: ${process.env.RELEASE_URL}`,
-              `Published upstream: ${process.env.RELEASE_PUBLISHED_AT || 'not specified'}`,
-              '',
-              `Upstream source commit: \`${process.env.RELEASE_SOURCE_SHA}\``,
-              `Docker manifest digest: \`${process.env.RELEASE_DIGEST || 'not reported'}\``,
-              '',
-              '## Upstream release notes',
-              process.env.RELEASE_NOTES || 'No release notes provided upstream.',
-              '',
-              'This is an independent Docker packaging release, not an official upstream distribution.'
-            ].join('\n');
+              `- \`${image}:upstream-${process.env.SOURCE_SHORT}\``,
+              "",
+              "Platforms: `linux/amd64`, `linux/arm64`.",
+              `Manifest digest: \`${process.env.IMAGE_DIGEST || "not reported"}\``,
+              "",
+              "## Upstream source",
+              `- Official release: ${process.env.RELEASE_URL}`,
+              `- Published upstream: ${process.env.RELEASE_DATE || "not specified"}`,
+              `- Source commit: \`${process.env.SOURCE_SHA}\``,
+              "",
+              "## Upstream release notes",
+              upstream.body || "No upstream release notes provided.",
+              "",
+              "This image is independently packaged, not an official EffectCraft release."
+            ].join("\n");
             let existing;
             try {
-              existing = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag })).data;
-            } catch (error) {
-              if (error.status !== 404) throw error;
+              ({data: existing} = await github.rest.repos.getReleaseByTag({...context.repo, tag}));
+            } catch (e) {
+              if (e.status !== 404) throw e;
             }
+            const args = {
+              ...context.repo,
+              tag_name: tag,
+              name: `EffectCraft Web ${tag}`,
+              body,
+              draft: false,
+              prerelease: process.env.RELEASE_PRERELEASE === "true"
+            };
             if (existing) {
-              await github.rest.repos.updateRelease({
-                ...context.repo, release_id: existing.id, name: 'EffectCraft Web ' + tag,
-                body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.updateRelease({...args, release_id: existing.id});
             } else {
-              await github.rest.repos.createRelease({
-                ...context.repo, tag_name: tag, target_commitish: context.sha,
-                name: 'EffectCraft Web ' + tag, body, draft: false, prerelease: process.env.RELEASE_PRERELEASE === 'true'
-              });
+              await github.rest.repos.createRelease({...args, target_commitish: context.sha});
             }
